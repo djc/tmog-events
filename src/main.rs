@@ -1,25 +1,22 @@
 use std::collections::HashMap;
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File};
+use std::io::{self, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Datelike, Months, Utc};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, LINK};
-use serde::Deserialize;
+use clap::Parser;
+use gcp_auth::{provider, TokenProvider};
+use serde::{Deserialize, Serialize};
+use tracing::info;
 
 #[tokio::main]
-async fn main() {
-    let prev = Utc::now().checked_sub_months(Months::new(1)).unwrap();
-    let start = (prev.year(), prev.month());
-    let end = (prev.year(), prev.month() + 1);
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
-    let mut headers = HeaderMap::<HeaderValue>::default();
-    if let Ok(token) = fs::read_to_string("token.txt") {
-        eprintln!("using token from token.txt");
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", token.trim())).unwrap(),
-        );
-    };
+    let args = Args::parse();
+    let provider = provider().await?;
+    let config = basic_toml::from_slice::<Config>(&fs::read(&args.config)?)?;
 
     let client = reqwest::Client::builder()
         .user_agent(format!(
@@ -27,72 +24,49 @@ async fn main() {
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION")
         ))
-        .default_headers(headers)
-        .build()
-        .unwrap();
+        .build()?;
+
+    let cache = format!("{}.json", &args.month);
+    let events = match File::open(&cache) {
+        Ok(file) => {
+            info!(cache, "loading events from cache");
+            serde_json::from_reader::<_, Vec<String>>(BufReader::new(file))?
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            info!(cache, "failed to open cache: {err}");
+            let events = query(
+                &args.month,
+                &config.user,
+                &config.gcp_project,
+                &*provider,
+                &client,
+            )
+            .await?;
+            let mut writer = BufWriter::new(File::create(&cache)?);
+            info!(cache, "saving events to cache");
+            serde_json::to_writer(&mut writer, &events)?;
+            events
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     let mut map = HashMap::<String, HashMap<String, String>>::default();
-    let mut cur = Some(URL.to_owned());
-    'outer: loop {
-        let url = match cur.take() {
-            Some(url) => url,
-            None => break,
+    for event in events {
+        let event = serde_json::from_str::<Event>(&event)?;
+        let item = match (event.issue, event.pull_request) {
+            (Some(issue), None) => issue,
+            (None, Some(pr)) => pr,
+            _ => continue,
         };
 
-        eprintln!("fetching {url}");
-        let rsp = client.get(url).send().await.unwrap();
-        let link = rsp.headers().get(LINK).and_then(|hv| hv.to_str().ok());
-        let link = match link {
-            Some(link) => link,
-            None => {
-                eprintln!("{}", rsp.text().await.unwrap());
-                break;
-            }
+        let project = match item.project() {
+            Some(project) => project,
+            None => return Err(anyhow::Error::msg("no project for {item:?}")),
         };
 
-        for link in link.split(", ") {
-            if let Some((url, rel)) = link.split_once("; ") {
-                if rel == "rel=\"next\"" {
-                    cur = Some(
-                        url.strip_prefix('<')
-                            .unwrap()
-                            .strip_suffix('>')
-                            .unwrap()
-                            .to_owned(),
-                    );
-                }
-            }
-        }
-
-        let events = rsp.json::<Vec<Event>>().await.unwrap();
-        for event in events {
-            let mut data = match event {
-                Event::IssueComment(meta) => EventData::new(meta),
-                Event::Issues(meta) => EventData::new(meta),
-                Event::PullRequest(meta) => EventData::new(meta),
-                Event::PullRequestReview(meta) => EventData::new(meta),
-                Event::PullRequestReviewComment(meta) => EventData::new(meta),
-                Event::Release(meta) => EventData::new(meta),
-                _ => continue,
-            };
-
-            let month = (data.dt.year(), data.dt.month());
-            if month >= end {
-                continue;
-            } else if month < start {
-                break 'outer;
-            }
-
-            if data.url.contains("/issues/") && data.node_id.starts_with("PR_") {
-                data.url = data.url.replace("/issues/", "/pull/");
-            } else if data.url.contains("/pulls/") {
-                data.url = data.url.replace("/pulls/", "/pull/");
-            }
-
-            map.entry(data.project.clone())
-                .or_insert_with(HashMap::default)
-                .insert(data.url, data.title);
-        }
+        map.entry(project.to_owned())
+            .or_insert_with(HashMap::<String, String>::default)
+            .insert(item.html_url, item.title);
     }
 
     let mut stdout = std::io::stdout().lock();
@@ -103,146 +77,123 @@ async fn main() {
         }
         write!(stdout, "\n\n").unwrap();
 
-        for (url, title) in items {
-            let path = match url.strip_prefix(PREFIX) {
-                Some(path) => path,
-                None if url.starts_with("https://github.com/") => &url,
-                None => {
-                    eprintln!("unexpected url: {url}");
-                    continue;
-                }
-            };
-            write!(stdout, "* `{title} <https://github.com{path}>`_\n").unwrap();
+        let items = items
+            .into_iter()
+            .map(|(html_url, title)| ItemMeta { title, html_url });
+        for ItemMeta { title, html_url } in items {
+            write!(stdout, "* `{title} <{html_url}>`_\n")?;
         }
 
         write!(stdout, "\n").unwrap();
     }
+
+    Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-enum Event {
-    #[serde(rename = "CreateEvent")]
-    Create,
-    #[serde(rename = "DeleteEvent")]
-    Delete,
-    #[serde(rename = "ForkEvent")]
-    Fork,
-    #[serde(rename = "IssueCommentEvent")]
-    IssueComment(EventMeta<IssueEvent>),
-    #[serde(rename = "IssuesEvent")]
-    Issues(EventMeta<IssueEvent>),
-    #[serde(rename = "MemberEvent")]
-    Member,
-    #[serde(rename = "PublicEvent")]
-    Public,
-    #[serde(rename = "PullRequestEvent")]
-    PullRequest(EventMeta<PullRequestEvent>),
-    #[serde(rename = "PullRequestReviewEvent")]
-    PullRequestReview(EventMeta<PullRequestEvent>),
-    #[serde(rename = "PullRequestReviewCommentEvent")]
-    PullRequestReviewComment(EventMeta<PullRequestEvent>),
-    #[serde(rename = "PushEvent")]
-    Push,
-    #[serde(rename = "ReleaseEvent")]
-    Release(EventMeta<ReleaseEvent>),
-    #[serde(rename = "WatchEvent")]
-    Watch,
+async fn query(
+    month: &str,
+    user: &str,
+    project: &str,
+    provider: &dyn TokenProvider,
+    client: &reqwest::Client,
+) -> anyhow::Result<Vec<String>> {
+    info!("requesting token");
+    let token = provider
+        .token(&["https://www.googleapis.com/auth/bigquery"])
+        .await?;
+
+    info!(month, user, project, "querying BigQuery");
+    let url = format!("{BIG_QUERY}/projects/{project}/queries");
+    let data = JobsQueryData { query: format!("SELECT payload FROM githubarchive.month.{month} WHERE actor.login = '{user}' ORDER BY created_at") };
+    let rsp = client
+        .post(&url)
+        .json(&data)
+        .bearer_auth(token.as_str())
+        .send()
+        .await?;
+
+    let data = rsp.json::<JobsQueryResponse>().await?;
+    Ok(data
+        .rows
+        .into_iter()
+        .map(|mut row| {
+            assert_eq!(row.f.len(), 1);
+            row.f.pop().unwrap().v
+        })
+        .collect())
 }
 
-#[derive(Debug, Deserialize)]
-struct EventMeta<T> {
-    repo: Repo,
-    created_at: DateTime<Utc>,
-    payload: T,
-}
-
-struct EventData {
-    project: String,
-    dt: DateTime<Utc>,
-    node_id: String,
-    url: String,
-    title: String,
-}
-
-impl EventData {
-    fn new(meta: EventMeta<impl Into<ItemMeta>>) -> Self {
-        let item = meta.payload.into();
-        Self {
-            project: project(meta.repo.name),
-            dt: meta.created_at,
-            node_id: item.node_id,
-            url: item.url,
-            title: item.title,
+#[allow(dead_code)] // Helper function for generating formattable JSON
+fn dump(path: impl AsRef<Path>, events: &[String]) -> anyhow::Result<()> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    write!(writer, "[\n    ")?;
+    for (i, event) in events.iter().enumerate() {
+        if i > 0 {
+            write!(writer, ",\n    ")?;
         }
+        write!(writer, "{}", event)?;
     }
+    write!(writer, "\n]\n")?;
+    Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-struct IssueEvent {
-    issue: ItemMeta,
+#[derive(Debug, Deserialize, Serialize)]
+struct Event {
+    issue: Option<ItemMeta>,
+    pull_request: Option<ItemMeta>,
 }
 
-impl Into<ItemMeta> for IssueEvent {
-    fn into(self) -> ItemMeta {
-        self.issue
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct PullRequestEvent {
-    pull_request: ItemMeta,
-}
-
-impl Into<ItemMeta> for PullRequestEvent {
-    fn into(self) -> ItemMeta {
-        self.pull_request
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ReleaseEvent {
-    release: ReleaseData,
-}
-
-impl Into<ItemMeta> for ReleaseEvent {
-    fn into(self) -> ItemMeta {
-        ItemMeta {
-            node_id: self.release.node_id,
-            url: self.release.html_url,
-            title: self.release.name,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ReleaseData {
-    node_id: String,
-    html_url: String,
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ItemMeta {
-    node_id: String,
-    url: String,
+    html_url: String,
     title: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct Repo {
-    name: String,
-}
-
-fn project(project: String) -> String {
-    let (scope, repo) = project.split_once('/').unwrap();
-    match PEOPLE.contains(&scope) {
-        true => repo.to_owned(),
-        false => project.to_owned(),
+impl ItemMeta {
+    fn project(&self) -> Option<&str> {
+        let path = self.html_url.strip_prefix("https://github.com/")?;
+        let mut parts = path.splitn(3, '/');
+        let org = parts.next()?;
+        let repo = parts.next()?;
+        Some(match REPO_PROJECT.contains(&org) {
+            true => repo,
+            false => org,
+        })
     }
 }
 
-const PEOPLE: &[&str] = &["djc", "nicoburns", "seanmonstar"];
-const PREFIX: &str = "https://api.github.com/repos";
-//const URL: &str = "https://api.github.com/users/djc/events/public?per_page=100";
-const URL: &str = "https://api.github.com/events?per_page=100";
+#[derive(Debug, Deserialize)]
+struct JobsQueryResponse {
+    rows: Vec<Row>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Row {
+    f: Vec<Field>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Field {
+    v: String,
+}
+
+#[derive(Debug, Serialize)]
+struct JobsQueryData {
+    query: String,
+}
+
+#[derive(Debug, Parser)]
+struct Args {
+    month: String,
+    #[clap(long, default_value = "config.toml")]
+    config: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    gcp_project: String,
+    user: String,
+}
+
+const REPO_PROJECT: &[&str] = &["djc", "nicoburns", "seanmonstar", "rust-lang", "hyperium"];
+const BIG_QUERY: &str = "https://bigquery.googleapis.com/bigquery/v2";
