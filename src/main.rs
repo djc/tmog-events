@@ -15,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let args = Args::parse();
+    let mut args = Args::parse();
     let provider = provider().await?;
     let config = fs::read(&args.config).context("failed to read config file")?;
     let config = basic_toml::from_slice::<Config>(&config)?;
@@ -28,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
         ))
         .build()?;
 
+    args.month.retain(|c| c != '-');
     let cache = format!("{}.json", &args.month);
     let events = match File::open(&cache) {
         Ok(file) => {
